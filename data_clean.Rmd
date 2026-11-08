@@ -1,0 +1,1002 @@
+---
+title: "Data Cleaning and Preprocessing Strategy for Agribusiness Datasets"
+subtitle: "A strategy document for a hypothetical agribusiness dataset, implemented in R / RStudio"
+author: "Suruthi D"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    number_sections: true
+    fig_width: 6.5
+    fig_height: 4
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+Agribusiness runs on data: farm surveys, field-level yield records, weather-station and soil-sensor feeds, satellite imagery, input purchase records and market price boards. These sources are collected by different people, with different instruments, at different times, so the combined dataset almost always arrives messy. Dates are written in several formats, units are mixed (acres and hectares, quintals and tonnes), sensors fail and leave placeholder codes, and surveyors spell the same crop or district in several ways.
+
+Analysis built on such data inherits every flaw. A mean yield inflated by one mistyped record, a regional comparison split across "TN" and "Tamil Nadu", or a model trained on duplicated farms will all produce misleading conclusions. The principle of "garbage in, garbage out" applies strongly here, so cleaning and preprocessing is the foundation of every later step.
+
+This document sets out a complete **strategy** for cleaning and preprocessing a hypothetical agribusiness dataset. It is written for **R and RStudio**, and every method is accompanied by the R tools that implement it. The strategy covers:
+
+- the common data quality issues found in agribusiness datasets;
+- a step-by-step data cleaning plan with explicit decision rules;
+- a framework for data preprocessing (imputation, transformation, scaling, encoding, feature engineering);
+- a workflow diagram showing the order of operations;
+- a worked, reproducible R example on simulated data, with before/after illustrations;
+- a discussion of why reproducibility matters and how to achieve it.
+
+# The Hypothetical Dataset
+
+To keep the strategy concrete, we assume a dataset called `farm_survey`: one row per farm per growing season, compiled from a field survey, a regional weather service and a market price board. The data dictionary is shown below.
+
+| Variable | Type | Description | Typical problems |
+|:---------------------|:-----------|:----------------------------------|:---------------------------------|
+| Farm ID | Identifier | Unique farm code, e.g. F0042 | Duplicated rows |
+| Region | Categorical | State or district | "TN", "tamil nadu", trailing spaces |
+| Crop | Categorical | Rice, Wheat, Maize, Sugarcane | "Paddy" vs "Rice", case differences |
+| Planting Date / Harvest Date | Date | Sowing and harvest dates | Mixed formats, harvest before planting |
+| Area Value / Area Unit | Numeric / Categorical | Cultivated area in ha or acres | Mixed units |
+| Yield (t/ha) | Numeric | Harvested yield per hectare (target variable) | Missing, negative, unit errors |
+| Fertilizer kg/ha | Numeric | Fertilizer applied per hectare | Missing values |
+| Rainfall (mm) | Numeric | Seasonal rainfall at the nearest station | Sensor outages, sentinel code -999 |
+| Soil pH | Numeric | Laboratory soil pH | Decimal-point slips (68 instead of 6.8) |
+| Price Raw | Text | Farm-gate price per kg | "Rs 22.5", "N/A" |
+| Irrigation Type | Categorical | Drip, Canal, Rainfed | Blank entries, case differences |
+
+## Packages and setup
+
+All examples in this document run in RStudio from top to bottom. The packages are loaded once here.
+
+```{r}
+library(tidyverse)    # dplyr, ggplot2, stringr, readr, ...
+library(lubridate)    # dates
+library(janitor)      # clean_names(), get_dupes()
+library(naniar)       # missing-data summaries and plots
+library(tidymodels)   # rsample + recipes for preprocessing
+
+set.seed(2026)        # fixed seed so simulated data and splits are reproducible
+```
+
+(Install once with `install.packages(c("tidyverse", "janitor", "naniar", "tidymodels"))`.)
+
+# Common Data Quality Issues in Agribusiness Datasets
+
+## Overview
+
+Data quality problems fall into a small number of recurring families. Recognising them is the first step, because each family has a typical cause, a typical detection method and a typical remedy.
+
+| Issue | Agribusiness example | Why it matters | How to detect (R) |
+|:-----------------|:-----------------------------|:-----------------------------|:--------------------------|
+| **Missing values** | Fertilizer use not reported; weather station offline | Biased averages, models that cannot run | `naniar::miss_var_summary()`, `colSums(is.na(df))` |
+| **Inconsistent formats** | Dates as 05/06/2024 and 2024-06-05; prices as "Rs 22.5" | Wrong sorting, failed calculations | `glimpse()`, `str_detect()` patterns |
+| **Inconsistent categories** | "Rice", "rice", "Paddy" | One crop split into groups | `count()`, `unique()` |
+| **Inconsistent units** | Area in acres and hectares | Yield per hectare wrong by a factor of 2.47 | Check unit columns, value ranges |
+| **Duplicates** | Same farm entered twice by two surveyors | Inflated sample size, leakage between train and test | `janitor::get_dupes()`, `duplicated()` |
+| **Outliers** | Yield of 450 t/ha (unit error) vs a genuine drought-year low | Distorted means, regression lines | Boxplots, IQR or MAD rules, domain limits |
+| **Impossible values and sentinel codes** | Rainfall of -999, soil pH of 68 | Silent corruption of statistics | Range checks, `summary()` |
+| **Logical inconsistencies** | Harvest date earlier than planting date | Invalid season lengths | Cross-field rules |
+
+## Missing values and their mechanisms
+
+How a value came to be missing determines how it should be handled.
+
+- **MCAR (Missing Completely At Random):** the absence has nothing to do with the data, for example a lost survey page. Simple imputation is usually safe.
+- **MAR (Missing At Random):** missingness depends on other observed variables, for example smallholders report fertilizer use less often than commercial farms. Imputation should use related variables (group-wise or model-based).
+- **MNAR (Missing Not At Random):** missingness depends on the missing value itself, for example farms with poor yields decline to report them. No simple fix exists, so the limitation must be documented and sensitivity analysis considered.
+
+## Outliers: error or real signal?
+
+Agriculture is naturally variable. A very low yield may be a real drought or pest outbreak, while a yield of 450 t/ha is a unit or typing error. The strategy therefore never deletes extreme values automatically. Each is first **flagged**, then compared against agronomic limits, then either corrected (documented decimal slip), set to missing (impossible value) or retained (plausible extreme).
+
+# Step-by-Step Data Cleaning Plan
+
+## Guiding principles
+
+1. **The raw data is never edited.** All changes happen in code, so every transformation is visible and repeatable.
+2. **Rules before statistics.** Deterministic, domain-based fixes (unit conversion, label mapping) come first; data-dependent steps (imputation, scaling) come later.
+3. **Flag, do not silently delete.** Every removal or correction is logged and, where useful, kept as a flag column.
+4. **Check after every step.** Row counts and summaries are logged so unintended data loss is caught immediately.
+
+## The ten steps at a glance
+
+| Step | Goal | Method | R tools | Decision rule |
+|:-----|:----------------|:---------------------------|:-------------------|:------------------------------|
+| 1 | **Ingest and profile** | Read data with explicit column types; inspect structure, ranges, missingness | `readr::read_csv()`, `glimpse()`, `skimr::skim()` | Record initial row/column counts as the baseline |
+| 2 | **Standardise structure** | Consistent snake_case names; correct data types | `janitor::clean_names()`, `mutate()` | One name and one type per variable |
+| 3 | **Remove duplicates** | Drop exact duplicate rows; investigate duplicate IDs with different values | `distinct()`, `janitor::get_dupes()` | Exact copies removed; conflicting IDs reviewed manually |
+| 4 | **Standardise categories** | Trim whitespace, unify case, map synonyms with a lookup table | `stringr::str_squish()`, `str_to_title()`, `recode()` | Unmapped labels become `NA` and are reviewed, not guessed |
+| 5 | **Harmonise units and formats** | Convert acres to hectares; parse mixed date formats; strip currency text | `lubridate::ymd()`, `dmy()`, `readr::parse_number()` | All values expressed in one documented unit |
+| 6 | **Handle sentinel and impossible values** | Replace codes such as -999 with `NA`; apply range rules (e.g. pH 3 to 10) | `na_if()`, `if_else()` | Out-of-range becomes `NA`; clear decimal slips corrected and documented |
+| 7 | **Check logical consistency** | Cross-field rules, e.g. harvest after planting, season length 60 to 240 days | `mutate()` with date arithmetic | Violations set to `NA` and flagged |
+| 8 | **Detect and treat outliers** | Group-wise IQR rule (3 x IQR) within each crop, then agronomic review | `quantile()`, `group_by()` | Flag all; set impossible values to `NA`; retain plausible extremes |
+| 9 | **Diagnose missingness** | Quantify per column and per row; create missing-indicator flags; judge MCAR/MAR/MNAR | `naniar::miss_var_summary()`, `gg_miss_var()` | Drop a column if over 50% missing and not essential; never impute the target |
+| 10 | **Validate and export** | Automated assertions; save cleaned data and cleaning log | `stopifnot()`, `assertr`, `write_csv()` | Pipeline stops if any assertion fails |
+
+## Step-by-step details with worked examples
+
+Each step below follows the same pattern: **why it is needed**, a **small worked example** with code that runs on its own, the **expected result**, and the **decision rule** applied. The examples use tiny hand-made tables so the effect of each step can be checked by eye. All numbers are hypothetical.
+
+### Step 1: Ingest and profile
+
+**Why:** before changing anything, record what the file looks like, so later steps can be measured against a baseline. Reading every column as text first prevents R from silently guessing wrong types (for example turning "05/06/2024" into a string of unknown format, or "N/A" into a failed number).
+
+```{r eval=FALSE}
+farm_raw <- read_csv("data/raw/farm_survey.csv",
+                     col_types = cols(.default = col_character()))   # read everything as text
+
+glimpse(farm_raw)                                    # columns and types
+skimr::skim(farm_raw)                                # distinct values, blanks, ranges
+farm_raw %>% summarise(across(everything(), ~ sum(is.na(.x) | .x == "")))   # blanks per column
+```
+
+A profiling checklist with the red flags to look for:
+
+| Check | R command | Red flag | Example finding in `farm_survey` |
+|:------------------|:--------------------------|:------------------------|:-------------------------------|
+| Size and structure | `dim()`, `glimpse()` | Fewer rows or columns than expected | 515 rows read, 500 farms expected |
+| Distinct labels | `count(crop)` | More labels than real categories | 7 spellings for 4 crops |
+| Blank or missing share | `miss_var_summary()` | Any column over 5% missing | Fertilizer 12% missing |
+| Numeric range | `summary()` | Negative or absurd min/max | Yield minimum -4.5, maximum 520 |
+| Duplicate keys | `get_dupes(farm_id)` | Any key appearing twice | 15 repeated farm IDs |
+| Format variety | `str_detect()` patterns | More than one date pattern | `dd/mm/yyyy` and `yyyy-mm-dd` mixed |
+
+**Decision rule:** record these numbers in the cleaning log as the baseline. Nothing is changed in this step.
+
+### Step 2: Standardise structure (names and types)
+
+**Why:** names such as `Yield (t/ha)` contain spaces and brackets that break code and are easy to mistype. Consistent snake_case names make every later line shorter and safer.
+
+```{r}
+make_clean_names(c("Farm ID", "Yield (t/ha)", "Fertilizer kg/ha", "Soil pH"))
+```
+
+| Original name | Cleaned name |
+|:------------------|:------------------|
+| Farm ID | `farm_id` |
+| Yield (t/ha) | `yield_t_ha` |
+| Fertilizer kg/ha | `fertilizer_kg_ha` |
+| Soil pH | `soil_ph` |
+
+**Decision rule:** one naming style for all columns, with the unit kept in the name (`_t_ha`, `_mm`, `_kg_ha`) so a value is never read without its unit. Types are fixed in later steps once values are standardised, for example dates become `Date` in Step 5.
+
+### Step 3: Remove duplicates
+
+**Why:** two surveyors may enter the same farm, or a file may be appended twice. Duplicates inflate the sample and, if they land in both the training and test sets, leak information. Exact copies are safe to drop, but two rows with the same ID and *different* values are a conflict that needs human review.
+
+```{r}
+dup_demo <- tibble(farm_id    = c("F001", "F001", "F002", "F002", "F003"),
+                   yield_t_ha = c(4.2,    4.2,    5.1,    5.8,    3.9))
+
+dup_demo %>% distinct()                          # drops the exact copy of F001
+dup_demo %>% distinct() %>% get_dupes(farm_id)   # F002 remains: conflicting yields
+```
+
+| Stage | Rows | What happened |
+|:-------------------------|:------|:--------------------------------------|
+| Before | 5 | F001 twice (identical), F002 twice (4.2 vs 5.8 conflict) |
+| After `distinct()` | 4 | The identical F001 copy was removed |
+| After `get_dupes(farm_id)` | 2 | Both F002 rows listed for manual review |
+
+**Decision rule:** exact copies are removed automatically and counted in the log; conflicting IDs are never resolved by guessing. They are exported to a `to_review.csv` file and checked against the original survey form.
+
+### Step 4: Standardise categorical labels
+
+**Why:** the same crop written as "Rice", " rice" and "Paddy" splits one group into three, so group averages and counts are wrong.
+
+```{r}
+crop_demo  <- c("Rice", " rice", "Paddy", "WHEAT", "wheat ", "Maize")
+n_distinct(crop_demo)                                              # 6 labels
+crop_fixed <- recode(str_to_title(str_squish(crop_demo)), Paddy = "Rice")
+crop_fixed                                                         # Rice Rice Rice Wheat Wheat Maize
+n_distinct(crop_fixed)                                             # 3 labels
+
+# Region labels use an explicit lookup table; anything unmapped becomes NA for review
+region_lookup <- c("tamil nadu" = "Tamil Nadu", "tn" = "Tamil Nadu",
+                   "punjab" = "Punjab",
+                   "maharashtra" = "Maharashtra", "mh" = "Maharashtra")
+region_demo <- c("Tamil Nadu", "TN", "Tamilnadu", "Punjab")
+unname(region_lookup[str_to_lower(region_demo)])                   # "Tamil Nadu" "Tamil Nadu" NA "Punjab"
+```
+
+| Raw crop value | After cleaning | | Raw region value | After lookup |
+|:----------|:----------|:--|:-------------|:-------------|
+| "Rice" | Rice | | "Tamil Nadu" | Tamil Nadu |
+| " rice" | Rice | | "TN" | Tamil Nadu |
+| "Paddy" | Rice | | "Tamilnadu" | `NA` (not in lookup, review) |
+| "WHEAT", "wheat " | Wheat | | "Punjab" | Punjab |
+
+**Decision rule:** trim and standardise case first, then map known synonyms with a lookup table kept under version control. An unmapped label is turned into `NA` and listed for review (the lookup is then extended). Labels are never guessed; for typo-heavy data, `stringdist::amatch()` can suggest candidates but a person approves them.
+
+### Step 5: Harmonise units and formats
+
+**Why:** a yield recorded in quintals per hectare, an area in acres or a date written day-first will silently corrupt calculations if mixed with the standard form.
+
+```{r}
+fmt_demo <- tibble(
+  planting_raw = c("05/06/2024", "2024-06-12", "17/06/2024"),
+  area_value   = c(5, 3, 1.5),
+  area_unit    = c("acre", "ha", "acre"),
+  price_raw    = c("Rs 22.5", "22.5", "N/A"),
+  yield_q_ha   = c(42, 38, NA)                         # quintals per hectare
+)
+
+fmt_demo %>% mutate(
+  planting_date = if_else(str_detect(planting_raw, "^\\d{4}-"),
+                          ymd(planting_raw, quiet = TRUE),     # ISO dates
+                          dmy(planting_raw, quiet = TRUE)),    # day-first dates
+  area_ha       = if_else(area_unit == "acre", area_value * 0.404686, area_value),
+  price_inr_kg  = suppressWarnings(parse_number(price_raw)),
+  yield_t_ha    = yield_q_ha / 10                      # 1 quintal = 0.1 tonne
+) %>% select(planting_date, area_ha, price_inr_kg, yield_t_ha)
+```
+
+| Raw value | Cleaned value | Rule applied |
+|:----------------|:--------------|:---------------------------------|
+| "05/06/2024" | 2024-06-05 | day-first convention |
+| "2024-06-12" | 2024-06-12 | already ISO format |
+| 5 acre | 2.02 ha | x 0.404686 |
+| 1.5 acre | 0.61 ha | x 0.404686 |
+| "Rs 22.5" | 22.5 | currency text stripped |
+| "N/A" | `NA` | not a number |
+| 42 q/ha | 4.2 t/ha | 1 quintal = 0.1 tonne |
+
+Standard conversions used in this project: 1 acre = 0.404686 ha, 1 quintal = 0.1 tonne, 1 tonne = 1000 kg. Local units such as the *bigha* differ between states, so they are converted only with a documented state-specific factor.
+
+**Decision rule:** one target unit per variable (ha, t/ha, kg/ha, mm, INR per kg), the date convention is written down (day-first for this survey), and the original unit column is kept until the conversion is verified.
+
+### Step 6: Handle sentinel codes and impossible values
+
+**Why:** codes such as -999 mean "sensor offline", not "negative rainfall". A pH of 68 is almost certainly 6.8 with a misplaced decimal. Valid ranges also differ by crop: a sugarcane yield of 75 t/ha is normal, while the same value for rice is impossible, so one global limit would be wrong.
+
+```{r}
+bounds <- tibble(crop      = c("Rice", "Wheat", "Maize", "Sugarcane"),
+                 yield_min = c(0.5, 0.5, 0.5, 20),
+                 yield_max = c(12,  9,   15,  150))       # illustrative; confirm with an agronomist
+
+chk <- tibble(farm_id     = c("F10", "F11", "F12", "F13"),
+              crop        = c("Rice", "Rice", "Wheat", "Sugarcane"),
+              yield_t_ha  = c(4.5, 450, 5.2, 75),
+              rainfall_mm = c(812, -999, 640, 1450),
+              soil_ph     = c(6.8, 68, 2.1, 7.2))
+
+chk %>%
+  left_join(bounds, by = "crop") %>%
+  mutate(
+    yield_t_ha  = if_else(between(yield_t_ha, yield_min, yield_max), yield_t_ha, NA_real_),
+    rainfall_mm = na_if(rainfall_mm, -999),
+    soil_ph     = if_else(soil_ph > 14 & soil_ph <= 100, soil_ph / 10, soil_ph),  # decimal slip
+    soil_ph     = if_else(between(soil_ph, 3, 10), soil_ph, NA_real_)
+  ) %>%
+  select(farm_id, crop, yield_t_ha, rainfall_mm, soil_ph)
+```
+
+| Farm | Field | Raw | Cleaned | Reason |
+|:------|:----------|:--------|:--------|:--------------------------------|
+| F10 | all fields | 4.5 / 812 / 6.8 | unchanged | all valid |
+| F11 | yield | 450 | `NA` | above the rice limit of 12 t/ha |
+| F11 | rainfall | -999 | `NA` | sentinel code for sensor offline |
+| F11 | soil pH | 68 | 6.8 | decimal slip corrected |
+| F12 | soil pH | 2.1 | `NA` | outside 3 to 10; not a clear slip |
+| F13 | yield | 75 | 75 | valid for sugarcane (20 to 150) |
+
+**Validation rules used in this project:**
+
+| Variable | Valid range | Action if outside |
+|:----------------------|:-------------------|:--------------------------------|
+| Yield | crop-specific (see `bounds`) | Set to `NA`, flag |
+| Soil pH | 3 to 10 | Divide by 10 if between 14 and 100 (slip), else `NA` |
+| Rainfall | 0 to 5000 mm; -999 is a sentinel | Sentinel to `NA`; out-of-range to `NA` |
+| Fertilizer | 0 to 600 kg/ha | Set to `NA` |
+| Area | above 0 ha | Set to `NA` |
+
+**Decision rule:** correct a value only when the cause is obvious and documented (the decimal slip); otherwise set it to `NA` and let the imputation step handle it. Every change is counted in the log.
+
+### Step 7: Check logical consistency
+
+**Why:** some errors are only visible by comparing fields. A harvest date before the planting date, or a reported production that does not match yield x area, cannot be caught by single-column range checks.
+
+```{r}
+logic_demo <- tibble(
+  farm_id       = c("F20", "F21", "F22"),
+  planting_date = as.Date(c("2024-06-10", "2024-06-12", "2024-06-15")),
+  harvest_date  = as.Date(c("2024-10-08", "2024-01-15", "2024-06-20")),
+  yield_t_ha    = c(4.5, 4.0, 4.2),
+  area_ha       = c(2, 1.5, 2),
+  production_t  = c(9.1, 6.0, 30)
+)
+
+logic_demo %>% mutate(
+  season_days   = as.numeric(harvest_date - planting_date),
+  season_ok     = between(season_days, 60, 240),
+  production_ok = abs(production_t - yield_t_ha * area_ha) <= 0.10 * (yield_t_ha * area_ha)
+) %>% select(farm_id, season_days, season_ok, production_ok)
+```
+
+| Farm | Season length (days) | `season_ok` | `production_ok` | Diagnosis |
+|:------|:-------------|:--------|:------------|:-------------------------------------|
+| F20 | 120 | TRUE | TRUE | consistent (9.1 vs 4.5 x 2 = 9.0) |
+| F21 | -149 | FALSE | TRUE | harvest recorded before planting |
+| F22 | 5 | FALSE | FALSE | season too short; production 30 t vs 8.4 t expected |
+
+**Decision rule:** the inconsistent field is set to `NA` (here the dates, or production) and the row is flagged. When the cause cannot be determined from the data, the record goes to the review list, not silently deleted.
+
+### Step 8: Detect and treat outliers
+
+**Why:** an outlier can be an error (450 t/ha) or a real event (a drought year). The strategy separates *detection* (a statistical rule), from *decision* (agronomic judgement using other fields).
+
+```{r}
+out_demo <- tibble(farm_id     = paste0("F", 30:38),
+                   crop        = "Rice",
+                   yield_t_ha  = c(4.1, 4.5, 3.9, 4.8, 5.0, 4.3, 450, 4.6, 1.9),
+                   rainfall_mm = c(820, 790, 760, 850, 900, 810, 800, 830, 310))
+
+out_demo %>% mutate(
+  q1   = quantile(yield_t_ha, 0.25),
+  q3   = quantile(yield_t_ha, 0.75),
+  iqr  = q3 - q1,
+  flag = yield_t_ha < q1 - 3 * iqr | yield_t_ha > q3 + 3 * iqr,
+  decision = case_when(
+    !flag               ~ "keep",
+    yield_t_ha > 12     ~ "set to NA (impossible for rice)",
+    rainfall_mm < 400   ~ "retain (drought year)",
+    TRUE                ~ "send for manual review"
+  )
+) %>% select(farm_id, yield_t_ha, rainfall_mm, flag, decision)
+```
+
+Here Q1 = 4.1, Q3 = 4.8 and IQR = 0.7, so the 3 x IQR fences are 2.0 and 6.9 t/ha.
+
+| Farm | Yield (t/ha) | Rainfall (mm) | Flagged | Decision |
+|:------|:--------|:---------|:-------|:-----------------------------------|
+| F30 to F35, F37 | 3.9 to 5.0 | 760 to 900 | No | keep |
+| F36 | 450 | 800 | Yes | set to `NA`: far above any rice yield, a typing or unit error |
+| F38 | 1.9 | 310 | Yes | retain: rainfall of 310 mm explains it as a drought year |
+
+The example also shows why robust rules are used. The mean of these nine yields is about 54 t/ha because of the single error, so a z-score rule based on the mean and standard deviation would be distorted by the very value it should detect (masking). Quartiles are barely affected.
+
+**Decision rule:** flag with a group-wise 3 x IQR rule (within each crop), then apply the decision sequence: impossible values to `NA`, plausible extremes supported by another variable retained, the rest sent for manual review.
+
+### Step 9: Diagnose missingness
+
+**Why:** the right treatment depends on *why* values are missing. Comparing the missing rate across groups is a quick practical test.
+
+```{r}
+miss_demo <- tibble(
+  farm_size        = rep(c("Small", "Large"), each = 10),
+  fertilizer_kg_ha = c(NA, NA, NA, 80, 95, 110, 90, 100, 85, 105,       # small farms
+                       120, 130, NA, 125, 140, 135, 128, 132, 138, 127)  # large farms
+)
+
+miss_demo %>%
+  group_by(farm_size) %>%
+  summarise(n = n(), pct_missing = mean(is.na(fertilizer_kg_ha)) * 100)
+```
+
+| Farm size | Farms | % missing fertilizer |
+|:----------|:------|:--------------------|
+| Small | 10 | 30% |
+| Large | 10 | 10% |
+
+Small farms report fertilizer use three times less often, so the missingness depends on an observed variable. That is **MAR**, which means imputing within farm-size groups is more appropriate than one overall average. For a formal check, `naniar::mcar_test()` tests the MCAR hypothesis.
+
+Action by amount of missing data:
+
+| Missing in a column | Action |
+|:----------------|:----------------------------------------------------------|
+| Under 5% | Median imputation, or deletion if MCAR |
+| 5% to 30% | Group-wise or model-based imputation plus a missing-indicator flag |
+| 30% to 50% | Impute with caution, run a sensitivity check with and without the variable |
+| Over 50% | Drop the column unless essential; document the decision |
+| Target variable (yield) | Never impute; exclude the row from model training |
+
+**Decision rule:** diagnose in the cleaning stage, but perform the actual imputation in the preprocessing stage on the training data only (see the preprocessing framework).
+
+### Step 10: Validate and export
+
+**Why:** a final automated check turns the cleaning rules into guarantees. If any rule is broken the pipeline stops, instead of passing a bad dataset on silently. A cleaning log records what changed.
+
+```{r}
+# Cleaning log: one row per step (illustrative numbers from the simulated data)
+add_log <- function(log, step, rows_in, rows_out, na_added = 0L, note = "") {
+  bind_rows(log, tibble(step = step, rows_in = rows_in, rows_out = rows_out,
+                        na_added = na_added, note = note))
+}
+
+cleaning_log <- tibble() %>%
+  add_log("3 remove duplicates",   515L, 500L,  0L, "15 exact copies dropped") %>%
+  add_log("4 standardise labels",  500L, 500L,  0L, "7 crop labels -> 4") %>%
+  add_log("6 sentinel/impossible", 500L, 500L, 31L, "rainfall -999, pH range, yield <= 0") %>%
+  add_log("7 logic checks",        500L, 500L,  6L, "6 harvest-before-planting dates") %>%
+  add_log("8 outliers",            500L, 500L,  5L, "5 yield errors set to NA")
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+write_csv(cleaning_log, "data/processed/cleaning_log.csv")
+```
+
+| Step | Rows in | Rows out | Values set to `NA` | Note |
+|:----------------------|:-----|:-----|:------|:---------------------------------------|
+| 3 remove duplicates | 515 | 500 | 0 | 15 exact copies dropped |
+| 4 standardise labels | 500 | 500 | 0 | 7 crop labels reduced to 4 |
+| 6 sentinel/impossible | 500 | 500 | 31 | rainfall -999, pH range, yield at or below 0 |
+| 7 logic checks | 500 | 500 | 6 | 6 harvest-before-planting dates |
+| 8 outliers | 500 | 500 | 5 | 5 yield errors set to `NA` |
+
+The assertion block that gates the export is shown in the end-to-end pipeline later in this document.
+
+**Decision rule:** export only if all assertions pass; the cleaning log is saved with the data so a reviewer can see exactly what was changed and how much.
+
+## Methods toolbox
+
+The table below summarises the generic approaches available for the three main problem types named in the task, with guidance on when each is appropriate.
+
+| Problem | Method | Use when | Caution |
+|:----------|:-----------------------|:------------------------|:------------------------|
+| **Missing values** | Listwise deletion | Under 5% missing, MCAR | Loses data; biases results if not MCAR |
+| | Mean / median imputation | Numeric, low missingness; median for skewed data | Shrinks variance |
+| | Group-wise median (by crop or region) | Values differ systematically between groups (MAR) | Needs adequate group sizes |
+| | KNN imputation | Related variables available, moderate missingness | Needs scaling first; slower |
+| | Multiple imputation (MICE) | Inference needed, MAR data | More complex; run on training data only for modelling |
+| | Missing-indicator flag | Missingness itself may be informative | Adds columns |
+| **Inconsistent formats** | Parsing and type conversion | Dates, numbers stored as text | Ambiguous dates (05/06) need a documented convention |
+| | Lookup-table recoding | Synonyms and spelling variants | Keep the table under version control |
+| | Unit conversion | Mixed units | Always keep the unit column until verified |
+| **Outliers** | Domain limits | Physical or agronomic bounds known | Needs expert input |
+| | IQR / MAD rule | Skewed data, robust detection | Run within groups (per crop) |
+| | Winsorising | Keep rows but limit influence | Alters real values; document it |
+| | Log transform | Right-skewed variables (area, price) | Needs positive values |
+| **Filtering** | Row filter | Remove invalid or out-of-scope records | Log every removal |
+| | Column filter | Drop near-empty or constant columns | Check importance first |
+
+# Proposed Framework for Data Preprocessing
+
+## Cleaning versus preprocessing
+
+**Cleaning** repairs errors using rules, and the same repair applies regardless of how the data is later used. **Preprocessing** prepares the clean data for a specific analysis or model, and many of its steps learn parameters from the data (a mean for imputation, a standard deviation for scaling). Those parameters must be learned from the **training data only** and then applied to the test data. Learning them from the full dataset leaks information from the test set and gives over-optimistic results.
+
+## Framework stages
+
+| Stage | Purpose | Techniques | R implementation |
+|:------------|:------------------------|:----------------------------|:---------------------|
+| **A. Split** | Create training and test sets before any learning step | Stratified random split by crop | `rsample::initial_split(strata = crop)` |
+| **B. Impute** | Fill remaining gaps | Median (numeric); "unknown" level (categorical); optional KNN or MICE | `step_impute_median()`, `step_unknown()` |
+| **C. Feature engineering** | Create informative variables | Season length, rainfall per season day, price per tonne, month of planting | `step_mutate()`, `lubridate::month()` |
+| **D. Transform** | Reduce skew | Log transform of area and price | `step_log()` |
+| **E. Scale** | Put numeric variables on comparable scales | Z-score standardisation (default); min-max for bounded inputs; robust scaling when outliers remain | `step_normalize()`, `step_range()` |
+| **F. Encode** | Make categories model-ready | One-hot encoding (nominal); ordinal codes where order exists | `step_dummy()` |
+| **G. Select** | Remove uninformative variables | Zero-variance filter, high-correlation filter (above 0.9) | `step_zv()`, `step_corr()` |
+| **H. Output** | Produce model-ready data and save the recipe | `prep()` on training data, `bake()` on both sets | `prep()`, `bake()`, `saveRDS()` |
+
+Packaging stages A to H in a single `recipes` object means that exactly the same preprocessing is applied to new data in future, which is essential for reproducibility and for deploying a model.
+
+## Worked numerical examples
+
+Small examples show what the main preprocessing operations actually do to the numbers.
+
+```{r}
+rain <- c(600, 800, 1000)
+(rain - mean(rain)) / sd(rain)                 # z-score:  -1  0  1
+(rain - min(rain)) / (max(rain) - min(rain))   # min-max:   0  0.5  1
+round(log(c(0.5, 2, 40)), 2)                   # log of farm area: -0.69  0.69  3.69
+
+imp_demo <- tibble(crop             = c("Rice", "Rice", "Rice", "Wheat", "Wheat"),
+                   fertilizer_kg_ha = c(100, 120, NA, 150, NA))
+
+imp_demo %>%
+  group_by(crop) %>%
+  mutate(fertilizer_imputed = if_else(is.na(fertilizer_kg_ha),
+                                      median(fertilizer_kg_ha, na.rm = TRUE),
+                                      fertilizer_kg_ha)) %>%
+  ungroup()
+```
+
+| Operation | Input | Output | Purpose |
+|:----------------|:------------------|:----------------------|:------------------------------------|
+| Z-score | rainfall 600, 800, 1000 mm | -1, 0, 1 | Mean 0 and standard deviation 1, so variables are comparable |
+| Min-max | rainfall 600, 800, 1000 mm | 0, 0.5, 1 | Rescales to the range 0 to 1 |
+| Log transform | area 0.5, 2, 40 ha | -0.69, 0.69, 3.69 | Compresses the long right tail of farm sizes |
+| Group median imputation | Rice fertilizer 100, 120, `NA` | `NA` becomes 110 | Uses the median of rice farms only |
+| Group median imputation | Wheat fertilizer 150, `NA` | `NA` becomes 150 | Only one wheat value exists, so the estimate is weak |
+
+The last row shows a limit of group-wise imputation: with very small groups the fill value rests on one observation, so a wider group (such as region) or a model-based method is safer.
+
+# Workflow Diagram
+
+The diagram shows the sequence of steps. The green boxes are **data cleaning** (rule-based, applied to all data) and the blue boxes are **preprocessing** (data-dependent, learned from the training set only).
+
+```{r workflow-diagram, echo=FALSE, fig.height=8.5, fig.width=6.5, fig.cap="Figure 1: Proposed data cleaning and preprocessing workflow"}
+steps <- c(
+  "1. Ingest & profile raw data",
+  "2. Standardise column names & data types",
+  "3. Remove duplicate records",
+  "4. Standardise categorical labels",
+  "5. Harmonise units & formats (dates, area, currency)",
+  "6. Replace sentinel codes & impossible values with NA",
+  "7. Check cross-field logic (harvest after planting)",
+  "8. Detect & treat outliers (flag, review, correct)",
+  "9. Diagnose missingness; add missing flags",
+  "10. Validate (assertions) & export clean data",
+  "11. Split into training and test sets",
+  "12. Impute gaps using training statistics",
+  "13. Engineer features, transform, scale, encode",
+  "14. Select features; save model-ready data & recipe"
+)
+k <- length(steps)
+par(mar = c(1, 0, 0, 0))
+plot(NULL, xlim = c(0, 10), ylim = c(-0.5, k + 0.9), axes = FALSE, xlab = "", ylab = "")
+for (i in seq_len(k)) {
+  y <- k - i + 1
+  rect(1, y - 0.33, 9, y + 0.33,
+       col = if (i <= 10) "#DCEFD9" else "#D6E4F5",
+       border = if (i <= 10) "#4C8C4A" else "#3B6EA8", lwd = 1.5)
+  text(5, y, steps[i], cex = 0.85)
+  if (i < k) arrows(5, y - 0.33, 5, y - 0.67, length = 0.07)
+}
+legend("bottom", horiz = TRUE, bty = "n", cex = 0.75,
+       fill = c("#DCEFD9", "#D6E4F5"),
+       legend = c("Data cleaning (rule-based)", "Preprocessing (training set only)"))
+```
+
+**Workflow as an ordered list**
+
+1. Read the raw data (kept read-only) and profile it.
+2. Standardise column names and data types.
+3. Remove duplicate records.
+4. Standardise categorical labels using a lookup table.
+5. Harmonise units and formats (dates, area, currency).
+6. Replace sentinel codes and impossible values with `NA`.
+7. Check cross-field logic (for example, harvest after planting).
+8. Detect and treat outliers (flag, review, then correct or set to `NA`).
+9. Diagnose missingness and create missing-indicator flags.
+10. Validate with automated assertions and save the **clean dataset** plus the cleaning log.
+11. Split into training and test sets.
+12. Impute remaining gaps using training-set statistics.
+13. Engineer features, transform, scale and encode.
+14. Select features and save the **model-ready data** and the saved recipe.
+
+If any validation in step 10 fails, the workflow returns to the relevant cleaning step, so the process is iterative until all checks pass.
+
+# End-to-End Pipeline on the Simulated Dataset
+
+The step-by-step examples above use tiny tables. This section combines all steps into one pipeline on a simulated 500-farm dataset. The simulated data deliberately contains the problems listed earlier, so the effect of each cleaning step can be seen.
+
+## Simulating the messy dataset
+
+```{r}
+n <- 500
+d_plant <- as.Date("2024-06-01") + sample(0:60, n, replace = TRUE)
+
+farm_raw <- tibble(
+  `Farm ID`          = sprintf("F%04d", 1:n),
+  Region             = sample(c("Tamil Nadu", "tamil nadu", "TN", "Punjab", "punjab ",
+                                "Maharashtra", "MH"), n, replace = TRUE),
+  Crop               = sample(c("Rice", "rice", "Paddy", "Wheat", "wheat",
+                                "Maize", "Sugarcane"), n, replace = TRUE),
+  `Planting Date`    = if_else(runif(n) < 0.5,
+                               format(d_plant, "%d/%m/%Y"),
+                               format(d_plant, "%Y-%m-%d")),
+  `Harvest Date`     = d_plant + sample(90:150, n, replace = TRUE),
+  `Area Value`       = round(rlnorm(n, log(2), 0.6), 2),
+  `Area Unit`        = sample(c("ha", "acre"), n, replace = TRUE, prob = c(0.7, 0.3)),
+  `Yield (t/ha)`     = round(rnorm(n, 4.5, 1.2), 2),
+  `Fertilizer kg/ha` = round(rnorm(n, 120, 30), 1),
+  `Rainfall (mm)`    = round(rnorm(n, 800, 150), 0),
+  `Soil pH`          = round(rnorm(n, 6.8, 0.5), 1),
+  `Price Raw`        = paste0("Rs ", round(rnorm(n, 22, 3), 1)),
+  `Irrigation Type`  = sample(c("Drip", "drip", "Canal", "Rainfed", ""), n, replace = TRUE)
+)
+
+# Inject typical problems
+idx <- function(p) sample(n, round(p * n))
+
+farm_raw$`Yield (t/ha)`[idx(0.08)]       <- NA                         # missing target
+farm_raw$`Yield (t/ha)`[sample(n, 5)]    <- c(450, 520, 380, -2, -4.5) # errors
+farm_raw$`Fertilizer kg/ha`[idx(0.12)]   <- NA
+farm_raw$`Rainfall (mm)`[idx(0.05)]      <- NA
+farm_raw$`Rainfall (mm)`[idx(0.03)]      <- -999                       # sentinel code
+farm_raw$`Soil pH`[sample(n, 4)]         <- c(68, 72, 65, 70)          # decimal slips
+farm_raw$`Price Raw`[idx(0.04)]          <- "N/A"
+farm_raw$`Harvest Date`[sample(n, 6)]    <- as.Date("2024-01-15")      # before planting
+
+farm_raw <- bind_rows(farm_raw, slice_sample(farm_raw, n = 15))        # 15 duplicates
+```
+
+## Step 1: Profile the raw data
+
+```{r}
+glimpse(farm_raw)                                   # structure and types
+farm_raw %>% clean_names() %>% miss_var_summary()   # missingness per column
+farm_raw %>% get_dupes() %>% nrow()                 # rows involved in duplication
+summary(farm_raw$`Yield (t/ha)`)                    # impossible values show up here
+```
+
+## Steps 2 to 9: The cleaning pipeline
+
+Each stage is a pipe step, and `log_step()` prints the row count after the major stages so unexpected data loss is visible.
+
+```{r}
+log_step <- function(df, label) {
+  message(sprintf("%-34s rows = %d", label, nrow(df)))
+  df
+}
+
+# Lookup table for region labels (kept under version control)
+region_lookup <- c("tamil nadu" = "Tamil Nadu", "tn" = "Tamil Nadu",
+                   "punjab" = "Punjab",
+                   "maharashtra" = "Maharashtra", "mh" = "Maharashtra")
+
+farm_clean <- farm_raw %>%
+  clean_names() %>%                                    # Step 2: names
+  rename_with(~ if_else(.x == "soil_p_h", "soil_ph", .x)) %>%   # janitor gives soil_p_h   <-- NEW LINE
+  log_step("raw (names standardised)") %>%
+  distinct() %>%                                       # Step 3: duplicates
+  log_step("duplicates removed") %>%
+  mutate(across(where(is.character), str_squish)) %>% # Step 4: categories
+  mutate(
+    region          = unname(region_lookup[str_to_lower(region)]),  # unmapped -> NA
+    crop            = recode(str_to_title(crop), Paddy = "Rice"),
+    irrigation_type = str_to_title(na_if(irrigation_type, "")),
+
+    # Step 5: formats and units
+    planting_date = if_else(str_detect(planting_date, "^\\d{4}-"),
+                            ymd(planting_date, quiet = TRUE),
+                            dmy(planting_date, quiet = TRUE)),
+    area_ha       = if_else(area_unit == "acre", area_value * 0.404686, area_value),
+    price_inr_kg  = suppressWarnings(parse_number(price_raw)),
+
+    # Step 6: sentinel codes and impossible values
+    rainfall_mm      = na_if(rainfall_mm, -999),
+    soil_ph          = if_else(soil_ph > 14 & soil_ph <= 100,
+                               soil_ph / 10, soil_ph),            # decimal slip
+    soil_ph          = if_else(soil_ph >= 3 & soil_ph <= 10, soil_ph, NA_real_),
+    yield_t_ha       = if_else(yield_t_ha > 0, yield_t_ha, NA_real_),
+    fertilizer_kg_ha = if_else(fertilizer_kg_ha >= 0, fertilizer_kg_ha, NA_real_),
+
+    # Step 7: logical consistency
+    season_days = as.numeric(harvest_date - planting_date),
+    season_days = if_else(season_days >= 60 & season_days <= 240,
+                          season_days, NA_real_)
+  ) %>%
+  log_step("values standardised and validated") %>%
+
+  # Step 8: outliers - flag with a group-wise 3 x IQR rule, then treat
+  group_by(crop) %>%
+  mutate(
+    q1 = quantile(yield_t_ha, 0.25, na.rm = TRUE),
+    q3 = quantile(yield_t_ha, 0.75, na.rm = TRUE),
+    yield_outlier = yield_t_ha < q1 - 3 * (q3 - q1) |
+                    yield_t_ha > q3 + 3 * (q3 - q1)
+  ) %>%
+  ungroup() %>%
+  mutate(yield_t_ha = if_else(yield_outlier %in% TRUE, NA_real_, yield_t_ha)) %>%
+
+  # Step 9: missing-indicator flags
+  mutate(across(c(fertilizer_kg_ha, rainfall_mm, soil_ph), is.na,
+                .names = "{.col}_missing")) %>%
+  select(farm_id, region, crop, irrigation_type, planting_date, harvest_date,
+         season_days, area_ha, yield_t_ha, yield_outlier, fertilizer_kg_ha,
+         rainfall_mm, soil_ph, price_inr_kg, ends_with("_missing"))
+```
+
+## Step 10: Validate and export
+
+```{r}
+miss_var_summary(farm_clean)     # remaining missingness, handled in preprocessing
+gg_miss_var(farm_clean)          # visual summary
+
+stopifnot(                       # the pipeline stops if any rule is broken
+  !anyDuplicated(farm_clean$farm_id),
+  all(farm_clean$crop   %in% c("Rice", "Wheat", "Maize", "Sugarcane")),
+  all(farm_clean$region %in% c("Tamil Nadu", "Punjab", "Maharashtra")),
+  all(farm_clean$yield_t_ha  > 0,  na.rm = TRUE),
+  all(farm_clean$rainfall_mm >= 0, na.rm = TRUE),
+  all(farm_clean$soil_ph >= 3 & farm_clean$soil_ph <= 10, na.rm = TRUE)
+)
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+write_csv(farm_clean, "data/processed/farm_clean.csv")
+```
+
+## Illustration: effect of outlier handling
+
+```{r}
+bind_rows(
+  tibble(stage = "Raw",     yield = farm_raw$`Yield (t/ha)`),
+  tibble(stage = "Cleaned", yield = farm_clean$yield_t_ha)
+) %>%
+  mutate(stage = factor(stage, levels = c("Raw", "Cleaned"))) %>%
+  ggplot(aes(stage, yield, fill = stage)) +
+  geom_boxplot(na.rm = TRUE, show.legend = FALSE) +
+  labs(title = "Yield before and after cleaning",
+       x = NULL, y = "Yield (t/ha)") +
+  theme_minimal()
+```
+
+Before cleaning, a few extreme values compress the boxplot into a thin line; after cleaning, the realistic spread of yields is visible.
+
+## Preprocessing with a recipe
+
+Rows with a missing yield are excluded because the target is never imputed. Everything else is learned from the **training set only**.
+
+```{r}
+model_df <- farm_clean %>%
+  filter(!is.na(yield_t_ha)) %>%
+  select(yield_t_ha, region, crop, irrigation_type, season_days, area_ha,
+         fertilizer_kg_ha, rainfall_mm, soil_ph, price_inr_kg)
+
+# A. Split (stratified by crop)
+split <- initial_split(model_df, prop = 0.8, strata = crop)
+train <- training(split)
+test  <- testing(split)
+
+# B-G. Define the preprocessing recipe
+rec <- recipe(yield_t_ha ~ ., data = train) %>%
+  step_unknown(all_nominal_predictors(), new_level = "unknown") %>%  # categorical gaps
+  step_impute_median(all_numeric_predictors()) %>%                   # numeric gaps
+  step_mutate(rain_per_day = rainfall_mm / season_days) %>%          # new feature
+  step_log(area_ha, price_inr_kg, offset = 1) %>%                    # reduce skew
+  step_normalize(all_numeric_predictors()) %>%                       # z-scores
+  step_dummy(all_nominal_predictors()) %>%                           # one-hot
+  step_zv(all_predictors())                                          # drop constants
+
+# H. Learn parameters on train, apply to both sets
+rec_prep   <- prep(rec, training = train)
+train_prep <- bake(rec_prep, new_data = NULL)
+test_prep  <- bake(rec_prep, new_data = test)
+
+colSums(is.na(train_prep))      # should be all zero
+glimpse(train_prep)
+
+saveRDS(rec_prep, "data/processed/preprocess_recipe.rds")
+```
+
+## Illustrative before and after records
+
+The table below shows hypothetical records as they pass through the pipeline.
+
+| Field | Raw value | Issue | Cleaned value |
+|:----------------|:-------------------|:-----------------------|:-----------------------|
+| Region | "tamil nadu", "TN" | Inconsistent labels | Tamil Nadu |
+| Crop | "Paddy", "rice" | Synonyms and case | Rice |
+| Planting date | 05/06/2024 and 2024-06-05 | Mixed formats | 2024-06-05 |
+| Area | 5 acre | Mixed units | 2.02 ha |
+| Rainfall | -999 | Sentinel code | `NA`, flagged, later imputed |
+| Soil pH | 68 | Decimal slip | 6.8 |
+| Yield | 450 t/ha | Impossible value | `NA`, flagged as outlier |
+| Price | "Rs 22.5" | Text with currency | 22.5 |
+| Harvest date | 2024-01-15 (planting 2024-06-10) | Harvest before planting | Season length `NA` |
+
+# Tools and Reproducibility
+
+## Why reproducibility matters
+
+Reproducibility means that anyone, including the original analyst months later, can run the same code on the same raw data and obtain identical results. In agribusiness this matters because:
+
+- **Trust and auditability:** decisions about farm advice, loans or supply contracts may rest on the analysis, and reviewers need to see exactly why a value was changed.
+- **Recurring data:** seasonal surveys arrive every year, so a scripted pipeline can be rerun in minutes rather than redone by hand.
+- **Error detection:** a scripted pipeline can be reviewed, tested and corrected, while manual spreadsheet edits leave no trace.
+- **Collaboration:** colleagues can continue the work without guessing which edits were made.
+- **Valid comparisons:** results from different seasons are comparable only if each was cleaned the same way.
+
+## The tool stack
+
+| Need | Tool | Concrete use in this project | Alternative |
+|:-----------------|:---------------|:----------------------------------|:-------------------|
+| Working environment | RStudio Project, `here` | One folder, relative paths with `here::here("data", "raw", "farm_survey.csv")` | VS Code with R extension |
+| Import | `readr` | `read_csv(col_types = cols(.default = col_character()))` | `data.table::fread()` |
+| Cleaning | `dplyr`, `tidyr`, `stringr`, `lubridate` | Recoding, unit conversion, date parsing | Base R |
+| Name and duplicate tools | `janitor` | `clean_names()`, `get_dupes()` | Base R |
+| Missing data | `naniar`, `mice` | `miss_var_summary()`, `mcar_test()`, multiple imputation | `VIM` |
+| Validation | `assertr`, `pointblank`, `stopifnot()` | Stop the pipeline if a rule is broken | `validate` |
+| Unit testing | `testthat` | Test each cleaning function on known inputs | `tinytest` |
+| Preprocessing | `rsample`, `recipes` | Stratified split, a saved preprocessing recipe | `caret::preProcess()` |
+| Pipeline automation | `targets` | Rebuild only the steps whose inputs changed | `drake` (retired), Makefile |
+| Package versions | `renv` | `renv::snapshot()` writes `renv.lock` | `groundhog` |
+| Version control | Git and GitHub | Every script and lookup table change is committed | GitLab |
+| Reporting | R Markdown | Code, results and explanation in one document | Quarto |
+
+## Project structure
+
+```text
+agribusiness-cleaning/
+  agribusiness-cleaning.Rproj
+  README.md                     <- how to run, data source, raw-file checksum
+  renv.lock                     <- exact package versions
+  _targets.R                    <- the pipeline definition
+  data/
+    raw/                        <- original files, read-only, never edited
+    processed/                  <- farm_clean.csv, cleaning_log.csv, to_review.csv
+  R/
+    cleaning_functions.R        <- reusable, documented functions
+    lookups.R                   <- region, crop and bounds tables
+  tests/testthat/
+    test-cleaning.R             <- unit tests
+  reports/
+    cleaning_strategy.Rmd       <- this report
+  docs/
+    decision_log.md             <- why each rule was chosen
+```
+
+Files that should not be committed are listed in `.gitignore`:
+
+```text
+.Rproj.user/
+.Rhistory
+.RData
+renv/library/
+_targets/
+data/processed/
+```
+
+## Setting up the environment
+
+```{bash eval=FALSE}
+git init
+git add .
+git commit -m "Initial project structure and raw-data checksum"
+```
+
+```{r eval=FALSE}
+install.packages("renv")
+renv::init()           # creates a project library and renv.lock
+renv::snapshot()       # run again after installing or updating packages
+renv::restore()        # on another machine: installs the exact locked versions
+```
+
+## Modular, documented functions
+
+Instead of long copy-pasted scripts, each cleaning rule is a small function with a description. The same function is used in the pipeline and in its tests.
+
+```{r eval=FALSE}
+# R/cleaning_functions.R
+
+#' Standardise crop labels: trim, title-case, map synonyms
+standardise_crop <- function(x) {
+  x <- stringr::str_to_title(stringr::str_squish(x))
+  dplyr::recode(x, Paddy = "Rice")
+}
+
+#' Convert area to hectares (1 acre = 0.404686 ha)
+to_hectares <- function(value, unit) {
+  dplyr::if_else(unit == "acre", value * 0.404686, value)
+}
+
+#' Flag values outside k x IQR fences
+flag_iqr <- function(x, k = 3) {
+  q <- stats::quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  x < q[1] - k * (q[2] - q[1]) | x > q[2] + k * (q[2] - q[1])
+}
+```
+
+## Automated unit tests
+
+Tests check each function against inputs whose correct answer is known, so a later edit that breaks a rule is caught immediately.
+
+```{r eval=FALSE}
+# tests/testthat/test-cleaning.R
+library(testthat)
+source(here::here("R", "cleaning_functions.R"))
+
+test_that("crop labels are unified", {
+  expect_equal(standardise_crop(c(" rice", "Paddy", "WHEAT")),
+               c("Rice", "Rice", "Wheat"))
+})
+
+test_that("acres are converted to hectares", {
+  expect_equal(to_hectares(5, "acre"), 2.02343, tolerance = 1e-4)
+  expect_equal(to_hectares(3, "ha"), 3)
+})
+
+test_that("a typing error is flagged but normal yields are not", {
+  y <- c(4.1, 4.5, 3.9, 4.8, 5.0, 4.3, 450, 4.6, 1.9)
+  expect_equal(which(flag_iqr(y)), c(7, 9))     # the 450 and the 1.9
+})
+```
+
+Run all tests with `testthat::test_dir("tests/testthat")`.
+
+## Automating the pipeline with `targets`
+
+`targets` records which step depends on which input. If only the lookup table changes, only the affected steps are rerun, and the whole analysis is rebuilt with one command.
+
+```{r eval=FALSE}
+# _targets.R
+library(targets)
+tar_option_set(packages = c("tidyverse", "janitor", "lubridate", "tidymodels"))
+source("R/cleaning_functions.R")
+
+list(
+  tar_target(raw_file,   "data/raw/farm_survey.csv", format = "file"),
+  tar_target(farm_raw,   read_csv(raw_file, col_types = cols(.default = col_character()))),
+  tar_target(farm_clean, clean_farm_data(farm_raw)),        # steps 2 to 9
+  tar_target(clean_log,  make_cleaning_log(farm_raw, farm_clean)),
+  tar_target(clean_file, {write_csv(farm_clean, "data/processed/farm_clean.csv");
+                          "data/processed/farm_clean.csv"}, format = "file"),
+  tar_target(model_recipe, build_recipe(farm_clean))        # preprocessing recipe
+)
+# Run:  targets::tar_make()      Inspect:  targets::tar_visnetwork()
+```
+
+## Protecting the raw data with a checksum
+
+A checksum proves the raw file has not been changed since the analysis was designed.
+
+```{r eval=FALSE}
+expected_md5 <- "d41d8cd98f00b204e9800998ecf8427e"      # placeholder; paste the real value in README.md
+actual_md5   <- unname(tools::md5sum("data/raw/farm_survey.csv"))
+stopifnot("Raw data has changed!" = identical(actual_md5, expected_md5))
+```
+
+## Decision log
+
+Every judgement call is written down with its reason, so a reviewer can challenge it. An example of `docs/decision_log.md`:
+
+| ID | Decision | Reason | Date |
+|:-----|:------------------------------------|:---------------------------------------------|:---------|
+| D-01 | Ambiguous dates are read day-first (05/06/2024 = 5 June) | The survey forms use dd/mm/yyyy | Nov 2026 |
+| D-02 | Outlier fence is 3 x IQR, not 1.5 x IQR | Crop yields vary naturally; 1.5 x flags too many real values | Nov 2026 |
+| D-03 | A flagged yield is retained when rainfall is below 400 mm | Drought explains genuinely low yields | Nov 2026 |
+| D-04 | The target (yield) is never imputed | Imputed targets create false patterns | Nov 2026 |
+| D-05 | Unmapped region labels become `NA` and go to `to_review.csv` | Guessing a district would hide data errors | Nov 2026 |
+
+## Random seeds and session information
+
+Any step with randomness (the train/test split, imputation by simulation) uses a fixed seed, and the software versions are stored with the output.
+
+```{r eval=FALSE}
+set.seed(2026)                                  # at the top of the pipeline
+writeLines(capture.output(sessionInfo()), "data/processed/session_info.txt")
+```
+
+## Reproducibility checklist
+
+| Check | How to verify | Status in this strategy |
+|:-----------------------------------|:---------------------------------------------|:------------------|
+| Raw data unchanged | MD5 checksum matches `README.md` | Required |
+| No manual edits | Every change is a line of code in `R/` | Required |
+| Same package versions | `renv::status()` reports no drift | Required |
+| Randomness controlled | `set.seed()` at the start; split is identical on rerun | Required |
+| Rules tested | `testthat::test_dir()` passes | Required |
+| Data validated | Assertions pass before export | Required |
+| Changes documented | `cleaning_log.csv` and `decision_log.md` updated | Required |
+| One-command rebuild | `targets::tar_make()` runs from raw to model-ready | Required |
+| Environment recorded | `session_info.txt` saved with outputs | Required |
+
+## How a reviewer reproduces the results
+
+```{bash eval=FALSE}
+git clone https://github.com/<your-username>/agribusiness-cleaning.git
+cd agribusiness-cleaning
+Rscript -e 'renv::restore()'                          # install the locked packages
+Rscript -e 'targets::tar_make()'                      # raw data -> clean -> model-ready
+Rscript -e 'testthat::test_dir("tests/testthat")'     # run the rule tests
+```
+
+Because the environment, the code, the rules and the data checksum are all fixed, the reviewer obtains the same cleaned dataset, the same log and the same recipe.
+
+# Quality Assurance and Risk Management
+
+| Risk | Consequence | Mitigation |
+|:----------------------------|:------------------------------|:-----------------------------------|
+| Over-aggressive outlier removal | Real droughts and bumper years erased | Flag first; agronomic review; keep plausible extremes |
+| Imputation bias | Underestimated variance, distorted relationships | Group-wise or model-based methods; missing-indicator flags; sensitivity checks |
+| Data leakage | Over-optimistic model performance | Split first; learn all parameters on training data only |
+| Wrong guess on ambiguous dates | Season lengths wrong | Documented day-first convention; logical season-length check |
+| Silent data loss | Biased sample | Row counts logged after every step |
+| Undocumented changes | Analysis cannot be audited or repeated | Scripts, version control, decision record |
+
+# Conclusion
+
+Agribusiness data is valuable but rarely arrives analysis-ready. This strategy treats cleaning as a structured, ordered process: profile the data, fix structure and labels, harmonise units and formats, remove impossible values, handle outliers with judgement, and diagnose missingness. A separate preprocessing framework then prepares the data for modelling without leaking information from the test set. The ten cleaning steps, the preprocessing recipe and the workflow diagram together give a clear sequence to follow, and the R example demonstrates that every decision can be written as code, logged and checked. Treating the whole pipeline as a reproducible, version-controlled script means the same trustworthy dataset can be rebuilt each season, and any conclusion drawn from it can be traced back to the raw data.
+
+```{r}
+sessionInfo()   # record R and package versions used for this report
+```
