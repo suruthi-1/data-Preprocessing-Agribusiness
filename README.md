@@ -166,7 +166,17 @@ The project follows reproducible data-analysis practices:
 - Reproducible cleaning and preprocessing workflows.
 - Model-ready data for further analysis.
 
-## 11. Limitations
+##11. Quality Assurance
+
+
+- Automated unit testing using testthat.
+- Data validation and consistency checks.
+- Outlier investigation using IQR.
+- Raw data integrity checks using MD5 checksums.
+- Reproducible execution using fixed random seeds.
+- Workflow automation using targets.
+
+## 12. Limitations
 
 This repository presents a strategy and starter implementation based on a hypothetical dataset. A separate real-world raw dataset and a complete executable end-to-end pipeline are not included.
 
