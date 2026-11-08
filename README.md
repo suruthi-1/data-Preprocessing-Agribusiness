@@ -198,11 +198,11 @@ This repository presents a strategy and starter implementation based on a hypoth
 
 ## 15.Grab
 
-[data viewer](data.png)
+![data viewer](data.png)
 _(Fig: RStudio Data Viewer showing test_prep, the preprocessed test set (92 rows, 16 columns). The numeric predictors are scaled and have no missing values (0% NA).)_
-[rstudio console](console.png)_
+![rstudio console](console.png)_
 _(Fig: RStudio Environment and Files panels showing the objects created by the pipeline (train: 363 observations, test: 92 observations, rec_prep, test_prep) and the project files.)_
-[environment](environment.png)
+![environment](environment.png)
 _(Fig: RStudio Console after running the cleaning and preprocessing pipeline, with View() used to inspect farm_raw, test, rec_prep and test_prep.)_
 
 **Project:** Data Cleaning and Preprocessing Strategy for Agribusiness Datasets  
