@@ -1,6 +1,5 @@
 # Data Cleaning and Preprocessing Strategy for Agribusiness Datasets
-
-**Author:** Suruthi D    
+  
 **Language:** R  
 **Environment:** RStudio
 
