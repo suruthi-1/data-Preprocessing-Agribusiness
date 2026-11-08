@@ -166,7 +166,7 @@ The project follows reproducible data-analysis practices:
 - Reproducible cleaning and preprocessing workflows.
 - Model-ready data for further analysis.
 
-##11. Quality Assurance
+## 11. Quality Assurance
 
 
 - Automated unit testing using testthat.
@@ -176,11 +176,17 @@ The project follows reproducible data-analysis practices:
 - Reproducible execution using fixed random seeds.
 - Workflow automation using targets.
 
-## 12. Limitations
+## 12. Conclusion
+
+This project demonstrates how a systematic data-cleaning and preprocessing strategy can improve the reliability and usability of agribusiness datasets.
+
+By combining R programming, automated validation, and reproducible workflows, the project provides a foundation for trustworthy agricultural data analysis and future predictive modelling.
+
+## 13. Limitations
 
 This repository presents a strategy and starter implementation based on a hypothetical dataset. A separate real-world raw dataset and a complete executable end-to-end pipeline are not included.
 
-## 12. Project Documentation
+## 14. Project Documentation
 
 - **Word Document:** `docs/strategy_for_agribusiness_datasets.docx`
 - **R Markdown Report:** `reports/data_clean.Rmd`
