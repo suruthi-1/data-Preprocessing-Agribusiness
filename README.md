@@ -181,4 +181,3 @@ This repository presents a strategy and starter implementation based on a hypoth
 ---
 
 **Project:** Data Cleaning and Preprocessing Strategy for Agribusiness Datasets  
-**Author:** Suruthi D
